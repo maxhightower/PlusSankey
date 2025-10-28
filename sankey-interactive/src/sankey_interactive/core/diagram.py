@@ -23,6 +23,7 @@ class SankeyDiagram:
         self.current_time_index = 0
         self.node_metric = None
         self.edge_metric = None
+        self.node_spacing_metric = None  # Metric for node spacing/positioning
         self.filters = {}
         self.fig = None
         
@@ -33,6 +34,24 @@ class SankeyDiagram:
     def set_edge_metric(self, metric_func: Callable[[pd.DataFrame], Dict[tuple, float]]):
         """Set function to calculate edge widths"""
         self.edge_metric = metric_func
+    
+    def set_node_spacing_metric(self, metric_func: Callable[[pd.DataFrame], Dict[str, float]]):
+        """
+        Set function to calculate horizontal spacing between node stages
+        
+        Args:
+            metric_func: Function that takes a DataFrame and returns a dict mapping
+                        node labels to spacing values (e.g., average wait time, processing delay).
+                        Higher values = more horizontal distance to the next stage.
+        
+        Example:
+            def wait_time_metric(df):
+                # Longer wait times = more horizontal space
+                return {'Processing': 5.2, 'Assembly': 3.1, 'Shipping': 8.5}
+            
+            diagram.set_node_spacing_metric(wait_time_metric)
+        """
+        self.node_spacing_metric = metric_func
         
     def add_filter(self, name: str, filter_func: Callable[[pd.DataFrame], pd.DataFrame]):
         """Add a filter function"""
@@ -80,6 +99,13 @@ class SankeyDiagram:
         if self.node_metric:
             node_values = self.node_metric(data)
         
+        # Calculate node positions if spacing metric is set
+        node_x, node_y = None, None
+        if self.node_spacing_metric:
+            node_x, node_y = self._calculate_node_positions(
+                all_nodes, source_indices, target_indices, data
+            )
+        
         # Customize edge colors for histogram effect
         edge_colors = self._calculate_edge_colors(data, source_col, target_col, 
                                                    value_col, show_histogram)
@@ -90,7 +116,9 @@ class SankeyDiagram:
             'target': target_indices,
             'value': values,
             'node_values': node_values,
-            'edge_colors': edge_colors
+            'edge_colors': edge_colors,
+            'node_x': node_x,
+            'node_y': node_y
         }
     
     def _calculate_edge_colors(self, data: pd.DataFrame, source_col: str, 
@@ -112,6 +140,124 @@ class SankeyDiagram:
             colors.append(f'rgba({r}, 100, {b}, 0.5)')
         
         return colors
+    
+    def _calculate_node_positions(self, all_nodes: List[str], 
+                                  source_indices: List[int],
+                                  target_indices: List[int],
+                                  data: pd.DataFrame) -> tuple:
+        """
+        Calculate x, y positions for nodes based on spacing metric
+        
+        Returns:
+            Tuple of (x_positions, y_positions) as lists, or (None, None) if no metric
+        """
+        if not self.node_spacing_metric:
+            return None, None
+        
+        # Get spacing values from metric (e.g., wait time, processing delay)
+        spacing_values = self.node_spacing_metric(data)
+        
+        if not spacing_values:
+            return None, None
+        
+        # Build graph to determine node stages/levels
+        node_to_idx = {node: idx for idx, node in enumerate(all_nodes)}
+        
+        # Determine the stage/level of each node using graph traversal
+        node_stages = {}
+        
+        # Start with sources (nodes that are never targets)
+        source_nodes = set()
+        target_nodes = set()
+        
+        for source_idx, target_idx in zip(source_indices, target_indices):
+            source_nodes.add(all_nodes[source_idx])
+            target_nodes.add(all_nodes[target_idx])
+        
+        # Nodes that only appear as sources are stage 0
+        only_sources = source_nodes - target_nodes
+        for node in only_sources:
+            node_stages[node] = 0
+        
+        # Iteratively assign stages
+        max_iterations = len(all_nodes)
+        for _ in range(max_iterations):
+            made_progress = False
+            for source_idx, target_idx in zip(source_indices, target_indices):
+                source_node = all_nodes[source_idx]
+                target_node = all_nodes[target_idx]
+                
+                if source_node in node_stages and target_node not in node_stages:
+                    node_stages[target_node] = node_stages[source_node] + 1
+                    made_progress = True
+                elif source_node in node_stages and target_node in node_stages:
+                    # Update if we found a longer path
+                    node_stages[target_node] = max(node_stages[target_node], 
+                                                   node_stages[source_node] + 1)
+            
+            if not made_progress:
+                break
+        
+        # Assign stages to any remaining nodes
+        for node in all_nodes:
+            if node not in node_stages:
+                node_stages[node] = 0
+        
+        # Group nodes by stage
+        stages = {}
+        for node, stage in node_stages.items():
+            if stage not in stages:
+                stages[stage] = []
+            stages[stage].append(node)
+        
+        # Calculate x positions with spacing proportional to metric
+        x_positions = [0.0] * len(all_nodes)
+        cumulative_x = 0.0
+        
+        sorted_stages = sorted(stages.keys())
+        
+        for i, stage_num in enumerate(sorted_stages):
+            stage_nodes = stages[stage_num]
+            
+            # Position all nodes in this stage at the same x
+            for node in stage_nodes:
+                node_idx = node_to_idx[node]
+                x_positions[node_idx] = cumulative_x
+            
+            # Calculate spacing to next stage based on metric
+            if i < len(sorted_stages) - 1:  # Not the last stage
+                # Get average metric value for nodes in this stage
+                stage_metric_values = [spacing_values.get(node, 0) for node in stage_nodes]
+                avg_metric = sum(stage_metric_values) / len(stage_metric_values) if stage_metric_values else 0
+                
+                # Normalize metric value to determine spacing
+                all_metric_values = list(spacing_values.values())
+                if all_metric_values:
+                    min_metric = min(all_metric_values)
+                    max_metric = max(all_metric_values)
+                    metric_range = max_metric - min_metric
+                    
+                    if metric_range > 0:
+                        normalized_metric = (avg_metric - min_metric) / metric_range
+                    else:
+                        normalized_metric = 0.5
+                    
+                    # Base spacing + proportional spacing based on metric
+                    # Higher metric = more horizontal distance
+                    base_spacing = 0.15
+                    proportional_spacing = 0.05 + (normalized_metric * 0.25)
+                    cumulative_x += base_spacing + proportional_spacing
+                else:
+                    cumulative_x += 0.2  # Default spacing
+        
+        # Normalize x positions to 0-1 range
+        if cumulative_x > 0:
+            x_positions = [x / cumulative_x for x in x_positions]
+        
+        # Let Plotly handle y positions automatically
+        y_positions = None
+        
+        return x_positions, y_positions
     
     def render(self, source_col: str, target_col: str, value_col: str,
               title: str = "Interactive Sankey Diagram",
@@ -161,14 +307,23 @@ class SankeyDiagram:
                              title: str) -> go.Figure:
         """Create a static Sankey figure"""
         
+        # Build node dict with optional positioning
+        node_dict = {
+            'pad': 25,  # Increased padding between nodes
+            'thickness': 20,
+            'line': dict(color="black", width=0.5),
+            'label': sankey_data['nodes'],
+            'color': "rgba(100, 150, 200, 0.8)"
+        }
+        
+        # Add node positions if spacing metric is set
+        if sankey_data.get('node_x') is not None:
+            node_dict['x'] = sankey_data['node_x']
+        if sankey_data.get('node_y') is not None:
+            node_dict['y'] = sankey_data['node_y']
+        
         fig = go.Figure(data=[go.Sankey(
-            node=dict(
-                pad=15,
-                thickness=20,
-                line=dict(color="black", width=0.5),
-                label=sankey_data['nodes'],
-                color="rgba(100, 150, 200, 0.8)"
-            ),
+            node=node_dict,
             link=dict(
                 source=sankey_data['source'],
                 target=sankey_data['target'],
@@ -180,7 +335,10 @@ class SankeyDiagram:
         fig.update_layout(
             title_text=title,
             font_size=12,
-            height=600
+            height=600,
+            margin=dict(l=50, r=50, t=80, b=50),  # Add padding around the diagram
+            plot_bgcolor='rgba(0,0,0,0)',  # Transparent background
+            paper_bgcolor='rgba(0,0,0,0)'  # Transparent paper
         )
         
         return fig
@@ -205,15 +363,24 @@ class SankeyDiagram:
                 time_data, source_col, target_col, value_col, show_histogram
             )
             
+            # Build node dict with optional positioning
+            node_dict = {
+                'pad': 25,  # Increased padding between nodes
+                'thickness': 20,
+                'line': dict(color="black", width=0.5),
+                'label': frame_sankey['nodes'],
+                'color': "rgba(100, 150, 200, 0.8)"
+            }
+            
+            # Add node positions if spacing metric is set
+            if frame_sankey.get('node_x') is not None:
+                node_dict['x'] = frame_sankey['node_x']
+            if frame_sankey.get('node_y') is not None:
+                node_dict['y'] = frame_sankey['node_y']
+            
             frames.append(go.Frame(
                 data=[go.Sankey(
-                    node=dict(
-                        pad=15,
-                        thickness=20,
-                        line=dict(color="black", width=0.5),
-                        label=frame_sankey['nodes'],
-                        color="rgba(100, 150, 200, 0.8)"
-                    ),
+                    node=node_dict,
                     link=dict(
                         source=frame_sankey['source'],
                         target=frame_sankey['target'],
@@ -303,6 +470,9 @@ class SankeyDiagram:
             title_text=title,
             font_size=12,
             height=700,
+            margin=dict(l=50, r=50, t=100, b=120),  # Extra bottom margin for timeline controls
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
             sliders=sliders,
             updatemenus=updatemenus
         )
