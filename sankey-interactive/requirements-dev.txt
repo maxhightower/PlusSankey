@@ -1,0 +1,10 @@
+numpy
+pandas
+matplotlib
+plotly
+pytest
+flake8
+black
+mypy
+jupyter
+seaborn
